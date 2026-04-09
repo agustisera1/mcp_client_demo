@@ -1,0 +1,26 @@
+{
+  "name": "mcp_client_demo",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "tsx src/index.ts",
+    "build": "tsc && node build/src/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.86.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@openrouter/sdk": "^0.11.2",
+    "dotenv": "^17.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
