@@ -1,55 +1,29 @@
-import { OpenRouter } from "@openrouter/sdk";
-import { ask, close } from "./rlinterface.js";
-import { MODEL, type ChatMessage } from "./types.js";
+import { chatLoop, MCPClient } from "./client.js";
+import { getAllowedDir } from "./rlinterface.js";
 
-import dotenv from "dotenv";
-dotenv.config();
+const absolute = process.env.ALLOWED_DIR_ABSOLUTE === "true";
+const allowedDir = getAllowedDir(absolute);
 
-const client = new OpenRouter({
-  apiKey: process.env.OPENROUTER_API_KEY,
-});
-
-const messages: ChatMessage[] = [];
+const FILESYSTEM_COMMAND = "npx";
+const FILESYSTEM_ARGS = [
+  "-y",
+  "@modelcontextprotocol/server-filesystem",
+  allowedDir,
+];
 
 async function main() {
+  const filemanagerClient = new MCPClient("file_manager", "1.0.0", {
+    filesystemRootHint: allowedDir,
+  });
   try {
-    while (true) {
-      const input = await ask();
-      if (!input) continue;
-      if (input === "exit") break;
-
-      messages.push({ role: "user", content: input });
-      console.info("Thinking...");
-
-      const stream = await client.chat.send({
-        chatRequest: {
-          model: MODEL,
-          messages: messages,
-          stream: true,
-        },
-      });
-
-      let response = "";
-
-      for await (const chunk of stream) {
-        const content = chunk.choices[0]?.delta?.content;
-        if (content) {
-          response += content;
-          process.stdout.write(content);
-        }
-      }
-
-      messages.push({ role: "assistant", content: response });
-      console.info("\n");
-    }
-  } catch (error) {
-    throw error;
+    await filemanagerClient.start(FILESYSTEM_COMMAND, FILESYSTEM_ARGS);
+    await chatLoop(filemanagerClient);
+  } catch (err) {
+    console.error(err);
+    process.exitCode = 1;
   } finally {
-    close();
+    await filemanagerClient.stop();
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exitCode = 1;
-});
+main();
