@@ -18,11 +18,23 @@ const openaiClient = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
 
-const messages: ChatCompletionMessageParam[] = [];
-
 /** Set MCP_DEBUG=true in .env for argument snippets and longer tool result previews. */
 const MCP_DEBUG =
   process.env.MCP_DEBUG === "1" || process.env.MCP_DEBUG === "true";
+
+/** Default cap on model<->tool iterations per user query. */
+const DEFAULT_MAX_ITERATIONS = 5;
+
+const FILESYSTEM_SYSTEM_PROMPT = `Sos un asistente que usa herramientas MCP de archivos en un entorno acotado.
+
+Reglas obligatorias:
+- Solo existen los directorios que figuran abajo o los que devuelve la herramienta list_allowed_directories. No inventes carpetas adicionales ni las menciones al usuario.
+- Las rutas en cada llamada a herramientas deben ser absolutas y estar contenidas en uno de esos directorios (o en una subcarpeta suya).
+- No uses el directorio del repositorio, el cwd del proceso Node, ni rutas fuera de la lista permitida.
+- Para list_directory, search_files o rutas por defecto: usá como raíz exactamente una de las rutas permitidas.
+- Si el usuario pide algo "aquí" o sin ruta, resolvelo bajo el primer directorio permitido o pedí aclaración.
+
+Directorios permitidos (fuente de verdad):`;
 
 function isFunctionToolCall(
   tc: ChatCompletionMessageToolCall,
@@ -67,48 +79,42 @@ function formatMcpToolResult(
 export type MCPClientOptions = {
   /** Same path passed to the filesystem MCP server; used if listing roots fails. */
   filesystemRootHint?: string;
+  /** Max model<->tool iterations per user query. Defaults to 5. */
+  maxIterations?: number;
 };
-
-const FILESYSTEM_SYSTEM_PROMPT = `Sos un asistente que usa herramientas MCP de archivos en un entorno acotado.
-
-Reglas obligatorias:
-- Solo podés leer, crear o mover archivos bajo los directorios permitidos que figuran abajo (o que devuelva la herramienta list_allowed_directories).
-- Las rutas que pases a las herramientas deben ser absolutas y quedar dentro de esos directorios.
-- No asumas el "directorio del proyecto" ni el cwd de Node: si no está en la lista, no es válido.
-- Si el usuario pide algo "aquí" o sin ruta, resolvelo dentro del primer directorio permitido o pedí aclaración.
-- Antes de crear carpetas o mover muchos archivos, conviene listar el directorio destino o usar search_files con rutas bajo un directorio permitido.
-
-Directorios permitidos (referencia):`;
 
 export class MCPClient {
   private client: Client;
   private transport: StdioClientTransport | null = null;
   private tools: ChatCompletionTool[] = [];
   private readonly filesystemRootHint?: string;
+  private readonly maxIterations: number;
   private allowedFilesystemBanner = "";
+  /**
+   * Conversation history for the Chat Completions endpoint.
+   *
+   * Index 0 is always the `system` message (installed during {@link start}).
+   * Subsequent entries alternate between `user`, `assistant`, and `tool` roles
+   * as the chat progresses. Scoped to the instance so multiple clients do not
+   * share history.
+   */
+  private messages: ChatCompletionMessageParam[] = [];
 
   constructor(name: string, version: string, options?: MCPClientOptions) {
     this.client = new Client({ name, version });
     this.filesystemRootHint = options?.filesystemRootHint;
+    this.maxIterations = options?.maxIterations ?? DEFAULT_MAX_ITERATIONS;
   }
 
   async start(command: string, args: string[]): Promise<void> {
     try {
-      const serverParams = {
-        command,
-        args,
-      } as const;
-
-      if (!serverParams.command || !serverParams.args) {
+      if (!command || !args) {
         throw new Error(
-          `Server arguments are incomplete, missing: ${JSON.stringify(serverParams)}`,
+          `Server arguments are incomplete: command=${command} args=${JSON.stringify(args)}`,
         );
       }
 
-      this.transport = new StdioClientTransport({
-        command: serverParams.command,
-        args: serverParams.args,
-      });
+      this.transport = new StdioClientTransport({ command, args });
       await this.client.connect(this.transport);
 
       const { tools: availableTools } = await this.client.listTools();
@@ -131,6 +137,14 @@ export class MCPClient {
             : "(desconocido)";
       }
 
+      // Install the system prompt once, as the first message of the conversation.
+      this.messages = [
+        {
+          role: "system",
+          content: `${FILESYSTEM_SYSTEM_PROMPT}\n${this.allowedFilesystemBanner}`,
+        },
+      ];
+
       console.info(
         `Available tools: ${availableTools.map((tool) => tool.name).join(", ")}`,
       );
@@ -141,25 +155,23 @@ export class MCPClient {
     }
   }
 
+  /** Drop all conversation history except the system prompt. */
+  resetConversation(): void {
+    const system = this.messages[0];
+    this.messages = system && system.role === "system" ? [system] : [];
+  }
+
   async processQuery(query: string): Promise<string> {
-    if (messages.length === 0) {
-      messages.push({
-        role: "system",
-        content: `${FILESYSTEM_SYSTEM_PROMPT}\n${this.allowedFilesystemBanner}`,
-      });
-    }
+    this.messages.push({ role: "user", content: query });
 
-    messages.push({ role: "user", content: query });
-
-    const maxIterations = 5;
     console.info(
-      `[mcp] processQuery start model=${MODEL} maxIterations=${maxIterations} debug=${MCP_DEBUG}`,
+      `[mcp] processQuery start model=${MODEL} maxIterations=${this.maxIterations} debug=${MCP_DEBUG}`,
     );
 
-    for (let iter = 0; iter < maxIterations; iter++) {
+    for (let iter = 0; iter < this.maxIterations; iter++) {
       const response = await openaiClient.chat.completions.create({
         model: MODEL,
-        messages,
+        messages: this.messages,
         tools: this.tools.length > 0 ? this.tools : undefined,
       });
 
@@ -171,7 +183,7 @@ export class MCPClient {
       const message = choice?.message;
       if (!message) {
         console.warn(
-          `[mcp] iteration ${iter + 1}/${maxIterations}: empty message (no choice content)`,
+          `[mcp] iteration ${iter + 1}/${this.maxIterations}: empty message (no choice content)`,
         );
         return "";
       }
@@ -180,10 +192,10 @@ export class MCPClient {
         message.tool_calls?.filter(isFunctionToolCall) ?? [];
 
       console.info(
-        `[mcp] iteration ${iter + 1}/${maxIterations}: finish_reason=${finishReason || "(none)"} tool_calls=${message.tool_calls?.length ?? 0} (function=${functionToolCalls.length})`,
+        `[mcp] iteration ${iter + 1}/${this.maxIterations}: finish_reason=${finishReason || "(none)"} tool_calls=${message.tool_calls?.length ?? 0} (function=${functionToolCalls.length})`,
       );
 
-      messages.push({
+      this.messages.push({
         role: "assistant",
         content: message.content,
         refusal: message.refusal,
@@ -243,18 +255,29 @@ export class MCPClient {
           );
         }
 
-        const result = await this.client.callTool({
-          name: toolCall.function.name,
-          arguments: args,
-        });
+        let text: string;
+        try {
+          const result = await this.client.callTool({
+            name: toolCall.function.name,
+            arguments: args,
+          });
+          text = formatMcpToolResult(result);
+        } catch (err) {
+          // Surface the error back to the model as a tool message so it can
+          // recover (e.g. retry with different arguments) instead of crashing
+          // the whole chat loop.
+          text = `Error: ${err instanceof Error ? err.message : String(err)}`;
+          console.warn(
+            `[mcp]   callTool ${toolCall.function.name} threw: ${text}`,
+          );
+        }
 
-        const text = formatMcpToolResult(result);
         const previewLen = MCP_DEBUG ? 1200 : 400;
         console.info(
           `[mcp]   tool result ${toolCall.function.name}: length=${text.length} preview=${truncForLog(text, previewLen)}`,
         );
 
-        messages.push({
+        this.messages.push({
           role: "tool",
           tool_call_id: toolCall.id,
           content: text,
@@ -263,7 +286,7 @@ export class MCPClient {
     }
 
     console.error(
-      `[mcp] exhausted ${maxIterations} iterations without a final assistant message. Increase maxIterations or inspect logs above.`,
+      `[mcp] exhausted ${this.maxIterations} iterations without a final assistant message. Increase maxIterations or inspect logs above.`,
     );
     throw new Error("The model did not return a final answer in time.");
   }
@@ -280,14 +303,24 @@ export async function chatLoop(client: MCPClient): Promise<void> {
       const input = await ask();
       if (!input) continue;
       if (input === "exit") break;
+      if (input === "reset" || input === "clear") {
+        client.resetConversation();
+        console.info("[mcp] conversation history cleared.");
+        continue;
+      }
 
       console.info("Answering...");
-      const reply = await client.processQuery(input);
-      console.info(reply);
-      console.info("\n");
+      try {
+        const reply = await client.processQuery(input);
+        console.info(reply);
+        console.info("\n");
+      } catch (err) {
+        // One failed query should not kill the whole session.
+        console.error(
+          `[mcp] query failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
-  } catch (error) {
-    throw error;
   } finally {
     closeInterface();
   }
