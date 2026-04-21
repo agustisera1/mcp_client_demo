@@ -1,5 +1,3 @@
-import path from "node:path";
-
 import { MODEL, OPENAI_API_KEY, OPENAI_BASE_URL } from "./constants.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -25,16 +23,12 @@ const MCP_DEBUG =
 /** Default cap on model<->tool iterations per user query. */
 const DEFAULT_MAX_ITERATIONS = 5;
 
-const FILESYSTEM_SYSTEM_PROMPT = `Sos un asistente que usa herramientas MCP de archivos en un entorno acotado.
+const SYSTEM_PROMPT = `Sos un asistente experto en recomendaciones de películas y series. Usás herramientas MCP para buscar información actualizada de TMDB y brindar recomendaciones personalizadas.
 
-Reglas obligatorias:
-- Solo existen los directorios que figuran abajo o los que devuelve la herramienta list_allowed_directories. No inventes carpetas adicionales ni las menciones al usuario.
-- Las rutas en cada llamada a herramientas deben ser absolutas y estar contenidas en uno de esos directorios (o en una subcarpeta suya).
-- No uses el directorio del repositorio, el cwd del proceso Node, ni rutas fuera de la lista permitida.
-- Para list_directory, search_files o rutas por defecto: usá como raíz exactamente una de las rutas permitidas.
-- Si el usuario pide algo "aquí" o sin ruta, resolvelo bajo el primer directorio permitido o pedí aclaración.
-
-Directorios permitidos (fuente de verdad):`;
+Reglas:
+- Usá siempre las herramientas disponibles para obtener datos reales antes de responder.
+- Si el usuario pide recomendaciones, buscá opciones relevantes y justificá cada sugerencia brevemente.
+- Respondé siempre en el idioma en que el usuario te habla.`;
 
 function isFunctionToolCall(
   tc: ChatCompletionMessageToolCall,
@@ -77,8 +71,6 @@ function formatMcpToolResult(
 }
 
 export type MCPClientOptions = {
-  /** Same path passed to the filesystem MCP server; used if listing roots fails. */
-  filesystemRootHint?: string;
   /** Max model<->tool iterations per user query. Defaults to 5. */
   maxIterations?: number;
 };
@@ -87,9 +79,7 @@ export class MCPClient {
   private client: Client;
   private transport: StdioClientTransport | null = null;
   private tools: ChatCompletionTool[] = [];
-  private readonly filesystemRootHint?: string;
   private readonly maxIterations: number;
-  private allowedFilesystemBanner = "";
   /**
    * Conversation history for the Chat Completions endpoint.
    *
@@ -102,7 +92,6 @@ export class MCPClient {
 
   constructor(name: string, version: string, options?: MCPClientOptions) {
     this.client = new Client({ name, version });
-    this.filesystemRootHint = options?.filesystemRootHint;
     this.maxIterations = options?.maxIterations ?? DEFAULT_MAX_ITERATIONS;
   }
 
@@ -120,35 +109,11 @@ export class MCPClient {
       const { tools: availableTools } = await this.client.listTools();
       this.tools = availableTools.map(mcpToolToOpenAITool);
 
-      try {
-        const rootsResult = await this.client.callTool({
-          name: "list_allowed_directories",
-          arguments: {},
-        });
-        this.allowedFilesystemBanner = formatMcpToolResult(rootsResult);
-      } catch (e) {
-        console.warn(
-          "[mcp] list_allowed_directories failed; using filesystemRootHint if set:",
-          e,
-        );
-        this.allowedFilesystemBanner =
-          this.filesystemRootHint != null && this.filesystemRootHint !== ""
-            ? path.normalize(this.filesystemRootHint)
-            : "(desconocido)";
-      }
-
-      // Install the system prompt once, as the first message of the conversation.
-      this.messages = [
-        {
-          role: "system",
-          content: `${FILESYSTEM_SYSTEM_PROMPT}\n${this.allowedFilesystemBanner}`,
-        },
-      ];
+      this.messages = [{ role: "system", content: SYSTEM_PROMPT }];
 
       console.info(
         `Available tools: ${availableTools.map((tool) => tool.name).join(", ")}`,
       );
-      console.info(`Allowed filesystem roots: ${this.allowedFilesystemBanner}`);
     } catch (e) {
       console.error("Failed to start MCP client");
       throw e;

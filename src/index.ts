@@ -1,36 +1,21 @@
 import { chatLoop, MCPClient } from "./client.js";
-import { getAllowedDirs } from "./rlinterface.js";
 
-const absolute = process.env.ALLOWED_DIR_ABSOLUTE === "true";
-const allowedDirs = getAllowedDirs(absolute).filter((d) => d.length > 0);
-
-const FILESYSTEM_COMMAND = "npx";
-const FILESYSTEM_ARGS = [
-  "-y",
-  "@modelcontextprotocol/server-filesystem",
-  ...allowedDirs,
-];
+const MOVIES_SERVER_BUILD_PATH = process.env.MOVIES_SERVER_BUILD_PATH;
+const MOVIES_SERVER_COMMAND = "node";
+const MOVIES_SERVER_ARGS = MOVIES_SERVER_BUILD_PATH
+  ? [MOVIES_SERVER_BUILD_PATH]
+  : [];
 
 async function main() {
-  if (allowedDirs.length === 0) {
-    console.error(
-      "Configura ALLOWED_DIR o ALLOWED_DIRS en .env (rutas absolutas, varias separadas por ;).",
-    );
-    process.exitCode = 1;
-    return;
-  }
-
-  const filemanagerClient = new MCPClient("file_manager", "1.0.0", {
-    filesystemRootHint: allowedDirs.join(", "),
-  });
+  const moviesClient = new MCPClient("tmbd_movies_recommendation", "1.0.0");
   try {
-    await filemanagerClient.start(FILESYSTEM_COMMAND, FILESYSTEM_ARGS);
-    await chatLoop(filemanagerClient);
+    await moviesClient.start(MOVIES_SERVER_COMMAND, MOVIES_SERVER_ARGS);
+    await chatLoop(moviesClient);
   } catch (err) {
     console.error(err);
-    process.exitCode = 1;
+    process.exit(0);
   } finally {
-    await filemanagerClient.stop();
+    await moviesClient.stop();
   }
 }
 
