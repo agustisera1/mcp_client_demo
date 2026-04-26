@@ -1,3 +1,4 @@
+import * as readline from "readline/promises";
 import { MODEL, OPENAI_API_KEY, OPENAI_BASE_URL } from "./constants.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -8,8 +9,6 @@ import type {
   ChatCompletionMessageToolCall,
   ChatCompletionTool,
 } from "openai/resources/chat/completions/completions.js";
-
-import { ask, close as closeInterface } from "./rlinterface.js";
 
 const openaiClient = new OpenAI({
   baseURL: OPENAI_BASE_URL,
@@ -76,6 +75,7 @@ export type MCPClientOptions = {
 };
 
 export class MCPClient {
+  private readlineInterface: readline.Interface | null = null;
   private client: Client;
   private transport: StdioClientTransport | null = null;
   private tools: ChatCompletionTool[] = [];
@@ -93,6 +93,10 @@ export class MCPClient {
   constructor(name: string, version: string, options?: MCPClientOptions) {
     this.client = new Client({ name, version });
     this.maxIterations = options?.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+    this.readlineInterface = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
   }
 
   async start(command: string, args: string[]): Promise<void> {
@@ -103,7 +107,11 @@ export class MCPClient {
         );
       }
 
-      this.transport = new StdioClientTransport({ command, args, env: process.env as Record<string, string> });
+      this.transport = new StdioClientTransport({
+        command,
+        args,
+        env: process.env as Record<string, string>,
+      });
       await this.client.connect(this.transport);
 
       const { tools: availableTools } = await this.client.listTools();
@@ -260,33 +268,52 @@ export class MCPClient {
     await this.client.close();
     this.transport = null;
   }
-}
 
-export async function chatLoop(client: MCPClient): Promise<void> {
-  try {
-    while (true) {
-      const input = await ask();
-      if (!input) continue;
-      if (input === "exit") break;
-      if (input === "reset" || input === "clear") {
-        client.resetConversation();
-        console.info("[mcp] conversation history cleared.");
-        continue;
-      }
+  messageCount(): number {
+    return this.messages.length || 0;
+  }
 
-      console.info("Answering...");
-      try {
-        const reply = await client.processQuery(input);
-        console.info(reply);
-        console.info("\n");
-      } catch (err) {
-        // One failed query should not kill the whole session.
-        console.error(
-          `[mcp] query failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
+  async ask(): Promise<string> {
+    if (!this.readlineInterface)
+      throw new Error("Could not ask through rlinterface");
+    return (
+      await this.readlineInterface?.question(
+        `"Message ${this.messageCount()} >: `,
+      )
+    ).trim();
+  }
+
+  async finish(): Promise<void> {
+    if (!this.readlineInterface)
+      throw new Error("Could not close the read-line interface");
+  }
+
+  async chatLoop(): Promise<void> {
+    try {
+      while (true) {
+        const input = await this.ask();
+        if (!input) continue;
+        if (input === "exit") break;
+        if (input === "reset" || input === "clear") {
+          this.resetConversation();
+          console.info("[mcp] conversation history cleared.");
+          continue;
+        }
+
+        console.info("Answering...");
+        try {
+          const reply = await this.processQuery(input);
+          console.info(reply);
+          console.info("\n");
+        } catch (err) {
+          // One failed query should not kill the whole session.
+          console.error(
+            `[mcp] query failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
+    } finally {
+      this.finish();
     }
-  } finally {
-    closeInterface();
   }
 }
