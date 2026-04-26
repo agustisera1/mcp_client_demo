@@ -103,7 +103,7 @@ export class MCPClient {
         );
       }
 
-      this.transport = new StdioClientTransport({ command, args });
+      this.transport = new StdioClientTransport({ command, args, env: process.env as Record<string, string> });
       await this.client.connect(this.transport);
 
       const { tools: availableTools } = await this.client.listTools();
